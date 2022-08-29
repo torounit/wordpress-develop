@@ -408,7 +408,14 @@ class WP_Tax_Query {
 
 		$join = $where = '';
 
-		$this->clean_query( $clause );
+		// BF: Buffer a non-referential copy of the input parameters before clean_query is called. For use when operator == AND
+		$input_clause = $clause;
+
+		// BF: Skip this step when AND
+		$operator = strtoupper( $clause['operator'] );
+		if ( 'AND' != $operator ) {
+			$this->clean_query( $clause );
+		}
 
 		if ( is_wp_error( $clause ) ) {
 			return self::$no_results;
@@ -463,6 +470,40 @@ class WP_Tax_Query {
 			)";
 
 		} elseif ( 'AND' == $operator ) {
+
+			if ( empty( $terms ) ) {
+				return $sql;
+			}
+
+			$input_terms = $input_clause['terms'];
+			$num_terms = count( $input_terms );
+
+			// BF: Loop each individual term...
+			$term_index = 0;
+			foreach ($terms as &$term) {
+
+				//BF: Be sure to use a non-manipulated query object to avoid double transformations of fields
+				$term_clause = $input_clause;
+
+				// Clean each term separately i.e. get children for each term separately
+				$this->clean_query( $term_clause, $term_index, $expanded_term);
+
+				$expanded_term = implode(',', $expanded_term);
+
+				$where .= $term_index > 0 ? ' AND ' : '';
+
+				$where .= "EXISTS (
+						SELECT 1
+						FROM $wpdb->term_relationships
+						WHERE term_taxonomy_id IN ($expanded_term)
+						AND object_id = $this->primary_table.$this->primary_id_column
+						)";
+
+				//BF: Reset $expanded_term before looping through next term...
+				$expanded_term = [];
+				$term_index++;
+			}
+		} elseif ( 'AND_ORIGINAL' == $operator ) {
 
 			if ( empty( $terms ) ) {
 				return $sql;
@@ -554,12 +595,18 @@ class WP_Tax_Query {
 	/**
 	 * Validates a single query.
 	 *
+	 * BF: ADDED HANDLING OF SINGLE TERMS. This function also gets hold of any term children.
+	 * DEFAULT: Handle the array of terms in query.
+	 *
 	 * @since 3.2.0
 	 * @access private
 	 *
 	 * @param array $query The single query. Passed by reference.
+	 * @param int $term_index The index of a specific term to be processed. Default = -1 //BF: Added
+	 * @param array $expanded_term The set of the specific term and its children. Default = [] //BF: Added
 	 */
-	private function clean_query( &$query ) {
+	private function clean_query( &$query, $term_index = -1, &$expanded_term = [] ) {
+
 		if ( empty( $query['taxonomy'] ) ) {
 			if ( 'term_taxonomy_id' !== $query['field'] ) {
 				$query = new WP_Error( 'invalid_taxonomy', __( 'Invalid taxonomy.' ) );
@@ -573,11 +620,7 @@ class WP_Tax_Query {
 			return;
 		}
 
-		if ( 'slug' === $query['field'] || 'name' === $query['field'] ) {
-			$query['terms'] = array_unique( (array) $query['terms'] );
-		} else {
-			$query['terms'] = wp_parse_id_list( $query['terms'] );
-		}
+		$query['terms'] = array_unique( (array) $query['terms'] );
 
 		if ( is_taxonomy_hierarchical( $query['taxonomy'] ) && $query['include_children'] ) {
 			$this->transform_query( $query, 'term_id' );
@@ -586,18 +629,36 @@ class WP_Tax_Query {
 				return;
 
 			$children = array();
-			foreach ( $query['terms'] as $term ) {
+
+			//BF: Individual handling if a specific term is input (term_index > -1)
+			if ( $term_index > -1 ) {
+
+				$term = $query['terms'][$term_index];
 				$children = array_merge( $children, get_term_children( $term, $query['taxonomy'] ) );
 				$children[] = $term;
-			}
-			$query['terms'] = $children;
-		}
 
-		$this->transform_query( $query, 'term_taxonomy_id' );
+				$expanded_term = $children;
+
+				$this->transform_query( $query, 'term_taxonomy_id', $expanded_term );
+			}
+			//BF: Or handle all the terms contained in the query
+			else {
+
+				foreach ( $query['terms'] as $term ) {
+					$children = array_merge( $children, get_term_children( $term, $query['taxonomy'] ) );
+					$children[] = $term;
+				}
+				$query['terms'] = $children;
+
+				$this->transform_query( $query, 'term_taxonomy_id' );
+			}
+		}
 	}
 
 	/**
 	 * Transforms a single query, from one field to another.
+	 *
+	 * BF: ADDED HANDLING of another set of terms than the one contained in the query itself.
 	 *
 	 * @since 3.2.0
 	 *
@@ -606,8 +667,9 @@ class WP_Tax_Query {
 	 * @param array  $query           The single query. Passed by reference.
 	 * @param string $resulting_field The resulting field. Accepts 'slug', 'name', 'term_taxonomy_id',
 	 *                                or 'term_id'. Default 'term_id'.
+	 * @param array $input_terms      An array of explicit terms. Passed by reference. If set then this is used instead of the query['terms']. Defaults to array[].
 	 */
-	public function transform_query( &$query, $resulting_field ) {
+	public function transform_query( &$query, $resulting_field, &$input_terms = [] ) {
 		global $wpdb;
 
 		if ( empty( $query['terms'] ) )
@@ -618,10 +680,19 @@ class WP_Tax_Query {
 
 		$resulting_field = sanitize_key( $resulting_field );
 
+		//BF: Evaluate and set which terms to be used
+		if ( !empty($input_terms) ) {
+			$active_terms = $input_terms;
+		}
+		else {
+			$active_terms = $query['terms'];
+		}
+
 		switch ( $query['field'] ) {
 			case 'slug':
 			case 'name':
-				foreach ( $query['terms'] as &$term ) {
+				//BF: Loop the given terms  ($active_terms)
+				foreach ( $active_terms as &$term ) {
 					/*
 					 * 0 is the $term_id parameter. We don't have a term ID yet, but it doesn't
 					 * matter because `sanitize_term_field()` ignores the $term_id param when the
@@ -630,7 +701,8 @@ class WP_Tax_Query {
 					$term = "'" . esc_sql( sanitize_term_field( $query['field'], $term, 0, $query['taxonomy'], 'db' ) ) . "'";
 				}
 
-				$terms = implode( ",", $query['terms'] );
+				// BF: Implode the given terms ($active_terms)
+				$terms = implode( ",", $active_terms );
 
 				$terms = $wpdb->get_col( "
 					SELECT $wpdb->term_taxonomy.$resulting_field
@@ -641,7 +713,8 @@ class WP_Tax_Query {
 				" );
 				break;
 			case 'term_taxonomy_id':
-				$terms = implode( ',', array_map( 'intval', $query['terms'] ) );
+				//BF: Use the given terms ($active_terms)
+				$terms = implode( ',', array_map( 'intval', $active_terms ) );
 				$terms = $wpdb->get_col( "
 					SELECT $resulting_field
 					FROM $wpdb->term_taxonomy
@@ -649,7 +722,8 @@ class WP_Tax_Query {
 				" );
 				break;
 			default:
-				$terms = implode( ',', array_map( 'intval', $query['terms'] ) );
+				//BF: Use the given terms ($active_terms)
+				$terms = implode( ',', array_map( 'intval', $active_terms ) );
 				$terms = $wpdb->get_col( "
 					SELECT $resulting_field
 					FROM $wpdb->term_taxonomy
@@ -658,12 +732,20 @@ class WP_Tax_Query {
 				" );
 		}
 
-		if ( 'AND' == $query['operator'] && count( $terms ) < count( $query['terms'] ) ) {
+		//BF: Use the given terms ($active_terms)
+		if ( 'AND' == $query['operator'] && count( $terms ) < count( $active_terms ) ) {
 			$query = new WP_Error( 'inexistent_terms', __( 'Inexistent terms.' ) );
 			return;
 		}
 
-		$query['terms'] = $terms;
+		//BF: Decide whether to set $input_terms or $query['terms'] with the transformed terms
+		if ( !empty($input_terms) ) {
+			$input_terms = $terms;
+		}
+		else {
+			$query['terms'] = $terms;
+		}
+
 		$query['field'] = $resulting_field;
 	}
 }
